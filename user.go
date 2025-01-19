@@ -14,10 +14,13 @@ import (
 const MailboxPathSep = "."
 
 type User struct {
-	id       uint64
-	username string
-	inboxId  uint64
-	parent   *Backend
+	id                  uint64
+	username            string
+	inboxId             uint64
+	publicKey           []byte
+	privateKeyEncrypted []byte
+	encryptionSalt      []byte
+	parent              *Backend
 }
 
 func (u *User) Username() string {

@@ -3,6 +3,10 @@ package imapsql
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"io"
@@ -68,14 +72,11 @@ type Delivery struct {
 func (d *Delivery) AddRcpt(username string, userHeader textproto.Header) error {
 	username = normalizeUsername(username)
 
-	uid, inboxId, err := d.b.getUserMeta(nil, username)
+	user, err := d.b.getUserOwned(username)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return ErrUserDoesntExists
-		}
 		return err
 	}
-	d.users = append(d.users, User{id: uid, username: username, parent: d.b, inboxId: inboxId})
+	d.users = append(d.users, user)
 
 	d.perRcptHeader[username] = userHeader
 
@@ -287,7 +288,16 @@ func (d *Delivery) mboxDelivery(header textproto.Header, mbox Mailbox, bodyLen i
 	if err != nil {
 		return err
 	}
-
+	// Encrypt body struct with public key of the user.
+	pubKey_serialized := mbox.user.publicKey
+	pubKey, err := x509.ParsePKCS1PublicKey(pubKey_serialized)
+	if err != nil {
+		return err
+	}
+	ciphertext, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pubKey, bodyStruct, nil)
+	if err != nil {
+		return err
+	}
 	if _, err = d.tx.Stmt(d.b.addExtKey).Exec(extBodyKey, mbox.user.id, 1); err != nil {
 		d.b.extStore.Delete([]string{extBodyKey})
 		return wrapErr(err, "Body (addExtKey)")
@@ -313,7 +323,7 @@ func (d *Delivery) mboxDelivery(header textproto.Header, mbox Mailbox, bodyLen i
 	_, err = d.tx.Stmt(d.b.addMsg).Exec(
 		mbox.id, msgId, date.Unix(),
 		length,
-		bodyStruct, cachedHeader, extBodyKey,
+		ciphertext, cachedHeader, extBodyKey,
 		0, d.b.Opts.CompressAlgo, persistRecent,
 	)
 	if err != nil {

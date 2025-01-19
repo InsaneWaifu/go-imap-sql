@@ -85,6 +85,10 @@ func (b *Backend) initSchema() error {
             -- It does not reference mboxes, since otherwise there will
             -- be recursive foreign key constraint.
             inboxId BIGINT DEFAULT 0
+
+			encryptionSalt BLOB DEFAULT NULL, 
+			encryptedPrivateKey BLOB DEFAULT NULL
+			publicKey BLOB DEFAULT NULL
 		)`)
 	if err != nil {
 		return wrapErr(err, "create table users")
@@ -147,7 +151,7 @@ func (b *Backend) initSchema() error {
 			bodyLen INTEGER NOT NULL,
 			mark INTEGER NOT NULL DEFAULT 0,
 
-			bodyStructure LONGTEXT NOT NULL,
+			bodyStructure BLOB NOT NULL,
 			cachedHeader LONGTEXT NOT NULL,
 			extBodyKey VARCHAR(255) DEFAULT NULL REFERENCES extKeys(id) ON DELETE RESTRICT,
 
@@ -198,7 +202,7 @@ func (b *Backend) prepareStmts() error {
 	var err error
 
 	b.userMeta, err = b.db.Prepare(`
-		SELECT id, inboxId
+		SELECT id, inboxId, encryptedPrivateKey, publicKey, encryptionSalt
 		FROM users
 		WHERE username = ?`)
 	if err != nil {
@@ -211,11 +215,11 @@ func (b *Backend) prepareStmts() error {
 	if err != nil {
 		return wrapErr(err, "listUsers prep")
 	}
-	b.addUser, err = b.db.Prepare(`
-		INSERT INTO users(username)
-		VALUES (?)`)
+	b.addUserWithSalt, err = b.db.Prepare(`
+		INSERT INTO users(username, encryptionSalt, encryptedPrivateKey, publicKey)
+		VALUES (?, ?, ?, ?)`)
 	if err != nil {
-		return wrapErr(err, "addUser prep")
+		return wrapErr(err, "addUserWithSalt prep")
 	}
 	b.delUser, err = b.db.Prepare(`
 		DELETE FROM users

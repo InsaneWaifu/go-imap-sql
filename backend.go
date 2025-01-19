@@ -1,6 +1,10 @@
 package imapsql
 
 import (
+	"crypto/aes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -12,6 +16,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	mess "github.com/foxcpp/go-imap-mess"
+	"golang.org/x/crypto/scrypt"
 )
 
 // VersionStr is a string value representing go-imap-sql version.
@@ -133,7 +138,7 @@ type Backend struct {
 	// Shitton of pre-compiled SQL statements.
 	userMeta           *sql.Stmt
 	listUsers          *sql.Stmt
-	addUser            *sql.Stmt
+	addUserWithSalt    *sql.Stmt
 	delUser            *sql.Stmt
 	listMboxes         *sql.Stmt
 	listSubbedMboxes   *sql.Stmt
@@ -373,17 +378,17 @@ func (b *Backend) Close() error {
 	return b.db.Close()
 }
 
-func (b *Backend) getUserMeta(tx *sql.Tx, username string) (id uint64, inboxId uint64, err error) {
+func (b *Backend) getUserMeta(tx *sql.Tx, username string) (id uint64, inboxId uint64, encryptedPrivateKey, publicKey, salt []byte, err error) {
 	var row *sql.Row
 	if tx != nil {
 		row = tx.Stmt(b.userMeta).QueryRow(username)
 	} else {
 		row = b.userMeta.QueryRow(username)
 	}
-	if err := row.Scan(&id, &inboxId); err != nil {
-		return 0, 0, err
+	if err = row.Scan(&id, &inboxId, &encryptedPrivateKey, &publicKey, &salt); err != nil {
+		return 0, 0, nil, nil, nil, err
 	}
-	return id, inboxId, nil
+	return
 }
 
 func normalizeUsername(u string) string {
@@ -391,12 +396,12 @@ func normalizeUsername(u string) string {
 }
 
 // CreateUser creates user account.
-func (b *Backend) CreateUser(username string) error {
-	_, _, err := b.createUser(nil, normalizeUsername(username))
+func (b *Backend) CreateUser(username string, password string) error {
+	_, _, err := b.createUser(nil, normalizeUsername(username), password)
 	return err
 }
 
-func (b *Backend) createUser(tx *sql.Tx, username string) (uid, inboxId uint64, err error) {
+func (b *Backend) createUser(tx *sql.Tx, username string, password string) (uid, inboxId uint64, err error) {
 	var shouldCommit bool
 	if tx == nil {
 		var err error
@@ -408,13 +413,38 @@ func (b *Backend) createUser(tx *sql.Tx, username string) (uid, inboxId uint64, 
 		shouldCommit = true
 	}
 
-	_, err = tx.Stmt(b.addUser).Exec(username)
+	salt := make([]byte, 32)
+	_, err = rand.Read(salt)
+	if err != nil {
+		return 0, 0, wrapErr(err, "CreateUser")
+	}
+	// Generate an RSA keypair, serialize it. Encrypt the private key with the password, using AES with a key generated with scrypt.
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return 0, 0, wrapErr(err, "CreateUser")
+	}
+	publicKey := privateKey.PublicKey
+	serializedPrivateKey := x509.MarshalPKCS1PrivateKey(privateKey)
+	serializedPublicKey := x509.MarshalPKCS1PublicKey(&publicKey)
+	scryptPassword, err := scrypt.Key([]byte(password), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return 0, 0, wrapErr(err, "CreateUser")
+	}
+	cipher, err := aes.NewCipher(scryptPassword)
+	if err != nil {
+		return 0, 0, wrapErr(err, "CreateUser")
+	}
+	encryptedPrivateKey := make([]byte, len(serializedPrivateKey))
+	cipher.Encrypt(encryptedPrivateKey, serializedPrivateKey)
+
+	_, err = tx.Stmt(b.addUserWithSalt).Exec(username, salt, encryptedPrivateKey, serializedPublicKey)
+
 	if err != nil && isForeignKeyErr(err) {
 		return 0, 0, ErrUserAlreadyExists
 	}
 
 	// TODO: Cut additional query here by using RETURNING on PostgreSQL.
-	uid, _, err = b.getUserMeta(tx, username)
+	uid, _, _, _, _, err = b.getUserMeta(tx, username)
 	if err != nil {
 		return 0, 0, wrapErr(err, "CreateUser")
 	}
@@ -514,23 +544,31 @@ func (b *Backend) ListUsers() ([]string, error) {
 
 // GetUser creates backend.User object for the user credentials.
 func (b *Backend) GetUser(username string) (backend.User, error) {
-	username = normalizeUsername(username)
-
-	uid, inboxId, err := b.getUserMeta(nil, username)
+	usr, err := b.getUserOwned(username)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrUserDoesntExists
-		}
 		return nil, err
 	}
-	return &User{id: uid, username: username, parent: b, inboxId: inboxId}, nil
+	return &usr, nil
+}
+
+func (b *Backend) getUserOwned(username string) (User, error) {
+	username = normalizeUsername(username)
+
+	uid, inboxId, encryptedPrivateKey, publicKey, salt, err := b.getUserMeta(nil, username)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return User{}, ErrUserDoesntExists
+		}
+		return User{}, err
+	}
+	return User{id: uid, username: username, parent: b, inboxId: inboxId, privateKeyEncrypted: encryptedPrivateKey, publicKey: publicKey, encryptionSalt: salt}, nil
 }
 
 // GetOrCreateUser is a convenience wrapper for GetUser and CreateUser.
 //
 // All database operations are executed within one transaction so
 // this method is atomic as defined by used RDBMS.
-func (b *Backend) GetOrCreateUser(username string) (backend.User, error) {
+func (b *Backend) GetOrCreateUser(username string, password string) (backend.User, error) {
 	username = normalizeUsername(username)
 
 	tx, err := b.db.Begin(false)
@@ -539,22 +577,22 @@ func (b *Backend) GetOrCreateUser(username string) (backend.User, error) {
 	}
 	defer tx.Rollback()
 
-	uid, inboxId, err := b.getUserMeta(tx, username)
+	uid, inboxId, encryptedPrivateKey, publicKey, salt, err := b.getUserMeta(tx, username)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			b.Opts.Log.Println("auto-creating storage account", username)
-			if uid, inboxId, err = b.createUser(tx, username); err != nil {
+			if uid, inboxId, err = b.createUser(tx, username, password); err != nil {
 				return nil, err
 			}
 		} else {
 			return nil, err
 		}
 	}
-	return &User{id: uid, username: username, parent: b, inboxId: inboxId}, tx.Commit()
+	return &User{id: uid, username: username, parent: b, inboxId: inboxId, privateKeyEncrypted: encryptedPrivateKey, publicKey: publicKey, encryptionSalt: salt}, tx.Commit()
 }
 
 func (b *Backend) Login(_ *imap.ConnInfo, username, password string) (backend.User, error) {
-	u, err := b.GetOrCreateUser(username)
+	u, err := b.GetOrCreateUser(username, password)
 	if err != nil {
 		return nil, err
 	}
